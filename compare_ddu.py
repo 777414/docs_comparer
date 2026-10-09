@@ -9,6 +9,8 @@ from difflib import SequenceMatcher
 from pathlib import Path
 
 from docx import Document
+from docx.table import Table
+from docx.text.paragraph import Paragraph
 
 MAIN_TITLE_PATTERN = re.compile(
     r"перечень\s+работ\s+на\s+объекте\s+долевого\s+строительства",
@@ -74,7 +76,31 @@ def read_docx(file_path: str) -> list[dict[str, str]]:
             and not VERB_FORM_PATTERN.search(text)
         )
 
-    for paragraph in document.paragraphs:
+    # Идём по элементам документа в исходном порядке: так можно обнаружить
+    # таблицу подписей и не сравнивать её или содержимое после неё.
+    for element in document.element.body.iterchildren():
+        tag = element.tag.rsplit("}", 1)[-1]
+
+        if tag == "tbl":
+            table = Table(element, document)
+            table_text = " ".join(
+                normalize_text(cell.text)
+                for row in table.rows
+                for cell in row.cells
+            )
+            if re.search(
+                r"\b(?:застройщик|участник\s+долевого\s+строительства)\b",
+                table_text,
+                re.IGNORECASE,
+            ):
+                break
+            # Остальные таблицы, как и раньше, не участвуют в сравнении.
+            continue
+
+        if tag != "p":
+            continue
+
+        paragraph = Paragraph(element, document)
         # Заголовок может быть отдельным жирным run в том же абзаце,
         # что и предыдущий раздел (например, «Прочее.»).
         segments: list[str] = []
