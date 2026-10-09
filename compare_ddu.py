@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Сравнение двух версий DOCX-документа с учетом порядка пунктов."""
+"""Сравнение двух версий DOCX-документа без учета порядка пунктов."""
 
 import json
 import re
@@ -9,7 +9,6 @@ from difflib import SequenceMatcher
 from pathlib import Path
 
 from docx import Document
-
 
 MAIN_TITLE_PATTERN = re.compile(
     r"перечень\s+работ\s+на\s+объекте\s+долевого\s+строительства",
@@ -23,20 +22,27 @@ LIST_MARKER_PATTERN = re.compile(
     r"^\s*(?:[-–—•▪◦●○]\s*|(?:\d+|[а-яёa-z])[.)]\s*|[IVXLCDM]+[.)]\s*)",
     re.IGNORECASE,
 )
-
+# Осторожная эвристика: не используем неоднозначные окончания вроде «-ены»,
+# которые встречаются в существительных («стены»).
+VERB_FORM_PATTERN = re.compile(
+    r"\b[а-яёa-z]+(?:ется|ются|ится|атся|ятся|ывается|ивается|"
+    r"ает|яет|ует|юет|уют|ают|яют|ишь|ешь|ете|им|ите|"
+    r"ать|ять|ить|ыть|ться|чь|ено|ена|ал|ала|али|ил|ила|или)\b",
+    re.IGNORECASE,
+)
 HEADING_SIMILARITY_THRESHOLD = 0.78
 MAX_HEADING_LENGTH = 100
 
 
 def normalize_text(text: str) -> str:
-    """Нормализует пробелы и технические переносы, сохраняя содержание."""
+    """Устраняет технические различия пробелов и переносов."""
     text = text.replace("\xa0", " ").replace("\u200b", "").replace("\ufeff", "")
     text = text.replace("\r", "\n")
     return re.sub(r"\s+", " ", text).strip()
 
 
 def normalize_content(text: str) -> str:
-    """Ключ сравнения: регистр, пробелы и начальные маркеры списка не важны."""
+    """Нормализует текст, сохраняя пунктуацию, числа и отрицания."""
     text = normalize_text(text)
     text = LIST_MARKER_PATTERN.sub("", text).strip()
     return text.casefold()
@@ -46,12 +52,8 @@ def normalize_heading(text: str) -> str:
     return normalize_content(text).strip(" \t\n.:;")
 
 
-def clean_paragraph(text: str) -> str:
-    return LIST_MARKER_PATTERN.sub("", normalize_text(text)).strip()
-
-
 def read_docx(file_path: str) -> list[dict[str, str]]:
-    """Читает только абзацы DOCX; таблицы намеренно игнорируются."""
+    """Читает абзацы; таблицы игнорирует, учитывает заголовки внутри форматированных runs."""
     path = Path(file_path)
     if not path.is_file():
         raise FileNotFoundError(f"Файл не найден: {path}")
@@ -59,14 +61,41 @@ def read_docx(file_path: str) -> list[dict[str, str]]:
         raise ValueError(f"Ожидается файл .docx: {path}")
 
     document = Document(str(path))
-    blocks = []
+    blocks: list[dict[str, str]] = []
+
+    def looks_like_inline_heading(run) -> bool:
+        text = normalize_text(run.text)
+        return bool(
+            run.bold
+            and text
+            and len(text) <= MAX_HEADING_LENGTH
+            and len(text.split()) <= 7
+            and text.endswith((".", ":"))
+            and not VERB_FORM_PATTERN.search(text)
+        )
+
     for paragraph in document.paragraphs:
-        text = normalize_text(paragraph.text)
-        if text:
-            blocks.append({
-                "text": text,
-                "style": paragraph.style.name or "",
-            })
+        # Заголовок может быть отдельным жирным run в том же абзаце,
+        # что и предыдущий раздел (например, «Прочее.»).
+        segments: list[str] = []
+        current = ""
+        for run in paragraph.runs:
+            if looks_like_inline_heading(run) and len(normalize_text(current)) > 80:
+                if normalize_text(current):
+                    segments.append(current)
+                segments.append(run.text)
+                current = ""
+            else:
+                current += run.text
+        if normalize_text(current):
+            segments.append(current)
+
+        for segment in segments:
+            if normalize_text(segment):
+                blocks.append({
+                    "text": segment,
+                    "style": paragraph.style.name or "",
+                })
 
     if not blocks:
         raise ValueError(f"В документе нет текста: {path}")
@@ -74,9 +103,9 @@ def read_docx(file_path: str) -> list[dict[str, str]]:
 
 
 def find_content_start(blocks: list[dict[str, str]]) -> int:
-    """Игнорирует текст до заголовка перечня работ, если он найден."""
+    """Игнорирует сведения до заголовка перечня работ, если он найден."""
     for index, block in enumerate(blocks):
-        if MAIN_TITLE_PATTERN.search(block["text"]):
+        if MAIN_TITLE_PATTERN.search(normalize_text(block["text"])):
             return index + 1
     return 0
 
@@ -90,46 +119,39 @@ def is_bullet(text: str) -> bool:
 
 
 def is_heading(blocks: list[dict[str, str]], index: int) -> bool:
-    """Эвристически определяет заголовок без фиксированного списка разделов."""
-    block = blocks[index]
-    text = normalize_text(block["text"])
-
-    if not text or MAIN_TITLE_PATTERN.search(text):
+    """Эвристически определяет заголовки без фиксированного списка названий."""
+    text = normalize_text(blocks[index]["text"])
+    if not text or MAIN_TITLE_PATTERN.search(text) or is_bullet(text):
         return False
 
-    style = block["style"].casefold()
+    style = blocks[index]["style"].casefold()
     if style.startswith(("heading", "заголовок")):
         return True
-
-    if len(text) > MAX_HEADING_LENGTH or is_bullet(text):
+    if len(text) > MAX_HEADING_LENGTH or index + 1 >= len(blocks):
         return False
-    if index + 1 >= len(blocks):
+    if VERB_FORM_PATTERN.search(text):
         return False
 
-    next_text = blocks[index + 1]["text"]
-    next_style = blocks[index + 1]["style"].casefold()
-
-    if is_bullet(next_text) or text.endswith(":"):
+    words = text.split()
+    if len(words) <= 7 and (text.endswith((".", ":")) or len(words) <= 3):
         return True
 
-    if text.endswith(".") and (
-        next_style.startswith(("heading", "заголовок")) or is_bullet(next_text)
-    ):
+    next_text = normalize_text(blocks[index + 1]["text"])
+    if text.endswith(":") and len(words) <= 12:
         return True
-
-    # Не считаем произвольную короткую строку заголовком только по длине:
-    # это снижает риск разбиения обычного текста на ложные разделы.
+    if is_bullet(next_text) and len(words) <= 10:
+        return True
     return False
 
 
 def extract_sections(
     blocks: list[dict[str, str]],
 ) -> dict[str, dict[str, object]]:
-    """Разбивает документ на разделы и сохраняет пункты независимо."""
+    """Разбивает документ на разделы, сохраняя текст пунктов и границы абзацев."""
     start = find_content_start(blocks)
     sections: dict[str, dict[str, object]] = {}
     current_heading = "вводная часть"
-    current_items: list[str] = []
+    current_paragraphs: list[str] = []
 
     def save_section() -> None:
         key = normalize_heading(current_heading)
@@ -140,34 +162,44 @@ def extract_sections(
             key = f"{key} [{suffix}]"
         sections[key] = {
             "display_name": current_heading,
-            "items": current_items.copy(),
+            "text": "\n".join(current_paragraphs),
         }
 
     for index in range(start, len(blocks)):
-        text = blocks[index]["text"]
+        text = normalize_text(blocks[index]["text"])
         if is_signature_start(text):
             break
-
         if is_heading(blocks, index):
             save_section()
-            current_heading = normalize_text(text).rstrip(".:")
-            current_items = []
+            current_heading = text.rstrip(".:")
+            current_paragraphs = []
         else:
-            item = clean_paragraph(text)
-            if item:
-                current_items.append(item)
+            current_paragraphs.append(text)
 
     save_section()
     return sections
 
 
-def section_counter(section: dict[str, object]) -> Counter:
-    """Сравнивает пункты без учета порядка, сохраняя число дубликатов."""
-    return Counter(
-        normalized
-        for item in section["items"]
-        if (normalized := normalize_content(item))
+def split_content_units(text: str) -> Counter:
+    """
+    Сравнивает пункты/предложения как мультимножество:
+    порядок и разбиение по абзацам не важны, дубликаты сохраняются.
+    """
+    text = text.replace("\r", "\n")
+    # Разделяем маркеры списков в начале абзаца и после пунктуации,
+    # но не разделяем дефис в конструкции вроде «Полы - выполняется...».
+    text = re.sub(
+        r"(?:^|\n|(?<=[.;]))\s*[-–—•▪◦●○]\s*",
+        "\n",
+        text,
     )
+    chunks = re.split(r"(?<=[.!?;])\s+", text)
+    units = []
+    for chunk in chunks:
+        normalized = normalize_content(chunk)
+        if normalized:
+            units.append(normalized)
+    return Counter(units)
 
 
 def heading_similarity(first: str, second: str) -> float:
@@ -176,16 +208,11 @@ def heading_similarity(first: str, second: str) -> float:
     ).ratio()
 
 
-def match_sections(
-    old_sections: dict[str, dict[str, object]],
-    new_sections: dict[str, dict[str, object]],
-) -> tuple[list[tuple[str, str]], list[str], list[str]]:
-    """Сначала сопоставляет точные заголовки, затем похожие."""
-    old_keys = list(old_sections)
-    new_keys = list(new_sections)
-    unmatched_old = set(old_keys)
-    unmatched_new = set(new_keys)
-    matches: list[tuple[str, str]] = []
+def match_sections(old_sections, new_sections):
+    """Сопоставляет разделы по точным, затем по похожим заголовкам."""
+    old_keys, new_keys = list(old_sections), list(new_sections)
+    unmatched_old, unmatched_new = set(old_keys), set(new_keys)
+    matches = []
 
     for old_key in old_keys:
         if old_key in unmatched_new:
@@ -214,10 +241,7 @@ def match_sections(
     )
 
 
-def compare_documents(
-    old_sections: dict[str, dict[str, object]],
-    new_sections: dict[str, dict[str, object]],
-) -> list[str]:
+def compare_documents(old_sections, new_sections) -> list[str]:
     differences = []
     matches, removed, added = match_sections(old_sections, new_sections)
 
@@ -234,7 +258,9 @@ def compare_documents(
             )
 
     for old_key, new_key in matches:
-        if section_counter(old_sections[old_key]) == section_counter(new_sections[new_key]):
+        old_text = split_content_units(old_sections[old_key]["text"])
+        new_text = split_content_units(new_sections[new_key]["text"])
+        if old_text == new_text:
             continue
 
         if old_key == "вводная часть":
@@ -262,8 +288,8 @@ def main() -> int:
     try:
         old_sections = extract_sections(read_docx(sys.argv[1]))
         new_sections = extract_sections(read_docx(sys.argv[2]))
-        result = build_result(compare_documents(old_sections, new_sections))
-        print(json.dumps(result, ensure_ascii=False, indent=2))
+        differences = compare_documents(old_sections, new_sections)
+        print(json.dumps(build_result(differences), ensure_ascii=False, indent=2))
         return 0
     except (OSError, ValueError, KeyError) as exc:
         print(
