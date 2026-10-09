@@ -278,9 +278,9 @@ def build_result(differences: list[str]) -> dict:
 
 
 def main() -> int:
-    if len(sys.argv) != 3:
+    if len(sys.argv) != 4:
         print(
-            f"Использование: {Path(sys.argv[0]).name} old.docx new.docx",
+            f"Использование: {Path(sys.argv[0]).name} old.docx new.docx result.json",
             file=sys.stderr,
         )
         return 2
@@ -289,7 +289,16 @@ def main() -> int:
         old_sections = extract_sections(read_docx(sys.argv[1]))
         new_sections = extract_sections(read_docx(sys.argv[2]))
         differences = compare_documents(old_sections, new_sections)
-        print(json.dumps(build_result(differences), ensure_ascii=False, indent=2))
+        result_json = json.dumps(
+            build_result(differences), ensure_ascii=False, indent=2
+        ) + "\n"
+
+        output_path = Path(sys.argv[3])
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(result_json, encoding="utf-8")
+
+        # Сохраняем прежнее поведение: JSON также выводится в stdout.
+        print(result_json, end="")
         return 0
     except (OSError, ValueError, KeyError) as exc:
         print(
